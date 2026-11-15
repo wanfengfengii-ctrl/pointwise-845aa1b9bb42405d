@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -14,8 +15,9 @@ import zipfile
 from pipeline import Engine, connect
 from localio import Gate, LocalBlobs, worker
 from exporter import export as stream_export
+import exportmgr
 
-CORE = ("ops.py", "pipeline.py", "localio.py", "exporter.py")
+CORE = ("ops.py", "pipeline.py", "localio.py", "exporter.py", "exportmgr.py")
 
 
 def bundle(source):
@@ -100,15 +102,38 @@ def job(command, root, input_path=None, once=False):
         if command == "status":
             result = engine.status()
             result["inventory"] = engine.blobs.inventory()
+            result["exports"] = exportmgr.status_exports(root)
             return result
+        place = exportmgr.paths(root)
         with worker(root):
+            # Reap exports left behind by a previous service instance.
+            exportmgr.reap(place)
             if once:
-                return {"progressed": engine.step()}
+                progressed = engine.step()
+                _checkpoint_wal(db)
+                return {"progressed": progressed}
+            last_reap = 0.0
             while True:
-                if not engine.step():
-                    time.sleep(0.1)
+                if engine.step():
+                    _checkpoint_wal(db)
+                    last_reap = 0.0
+                    continue
+                now = time.monotonic()
+                if now - last_reap >= exportmgr.REAP_INTERVAL:
+                    exportmgr.reap(place)
+                    _checkpoint_wal(db)
+                    last_reap = now
+                time.sleep(0.1)
     finally:
         db.close()
+
+
+def _checkpoint_wal(db):
+    """Best-effort truncation so a paused slow reader cannot grow the WAL."""
+    try:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.Error:
+        pass
 
 
 def main():
@@ -131,7 +156,7 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "export":
-            stream_export(args.root)
+            exportmgr.export(args.root)
             return
         if args.command == "build":
             result = build(args.out)
@@ -140,7 +165,8 @@ def main():
         else:
             result = job(args.command, args.root, getattr(args, "input", None), getattr(args, "once", False))
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-    except (ValueError, OSError, zipfile.BadZipFile, subprocess.CalledProcessError) as exc:
+    except (ValueError, OSError, zipfile.BadZipFile, subprocess.CalledProcessError,
+            exportmgr.ExportError) as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(1)
 

@@ -4,12 +4,11 @@
   "setup": [],
   "verify": [
     "python3",
-    "exportcheck.py",
-    "normal"
+    "releasecheck.py"
   ],
   "demo": [
     "python3",
-    "exportcheck.py",
+    "releasecheck.py",
     "demo"
   ]
 }
